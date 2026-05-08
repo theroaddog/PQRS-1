@@ -5,6 +5,8 @@ import bcrypt
 import base64
 import uuid
 import os
+from pathlib import Path
+from urllib.parse import quote
 import reflex as rx
 from .usuario_model import Usuario, Solicitud
 from sqlmodel import select, SQLModel, create_engine
@@ -14,9 +16,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
+
 # Carpeta donde se guardarán los archivos subidos por los usuarios
-UPLOAD_DIR = os.path.join(os.getcwd(), "assets", "uploads")
-from typing import List, Dict, Any
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = BASE_DIR / "assets" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+from typing import Any
 
 # Cargar variables de entorno
 load_dotenv()
@@ -26,13 +31,16 @@ SQLModel.metadata.create_all(engine)
 
 def tiene_password(password: str) -> str:
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
 def confirmar_contraseña(contraseña: str, hashed_password: str) -> bool:
     try:
         return bcrypt.checkpw(contraseña.encode('utf-8'), hashed_password.encode('utf-8'))
     except Exception:
         return False
+
 def validar_correo(correo: str) -> bool:
     return bool(re.fullmatch(r"[^@]+@[^@]+\.[^@]+", correo))
+
 def cantida_minima_contraseña(contraseña: str) -> bool:
     # Requiere: al menos 8 caracteres, una mayúscula, una minúscula,
     # un número y al menos un carácter especial (cualquier signo de puntuación).
@@ -43,6 +51,14 @@ def cantida_minima_contraseña(contraseña: str) -> bool:
         and re.search(r'[0-9]', contraseña)
         and re.search(r'[^\w\s]', contraseña) is not None
     )
+
+def sanitizar_nombre_archivo(nombre: str) -> str:
+    """Sanitiza un nombre de archivo para evitar problemas de seguridad."""
+    # Remover caracteres peligrosos
+    nombre = re.sub(r'[^\w\s\-\.]', '', nombre)
+    # Limitar la longitud
+    nombre = nombre[:255]
+    return nombre or "archivo"
 
 
 def enviar_correo_bienvenida(email_destinatario: str, email_usuario: str):
@@ -114,30 +130,34 @@ def enviar_correo_bienvenida(email_destinatario: str, email_usuario: str):
 def enviar_correo_notificacion(email_destinatario: str, asunto: str, cuerpo: str) -> bool:
     """Envía una notificación por correo electrónico al ciudadano sobre actualizaciones en su solicitud."""
     try:
-        # Configuración del servidor SMTP
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        email_sender = "tu_correo@gmail.com"  # Reemplaza con tu correo
-        email_password = "tu_contraseña_app"  # Reemplaza con tu contraseña de aplicación
-        
+        smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        email_sender = os.getenv("EMAIL_SENDER")
+        email_password = os.getenv("EMAIL_PASSWORD")
+        empresa_nombre = os.getenv("EMPRESA_NOMBRE", "Sistema de Gestión de PQRS")
+
+        if not email_sender or not email_password:
+            print("⚠️ Advertencia: Credenciales de correo no configuradas en .env")
+            return False
+
         # Crear el mensaje
-        mensaje = MIMEMultipart()
+        mensaje = MIMEMultipart("alternative")
         mensaje['From'] = email_sender
         mensaje['To'] = email_destinatario
         mensaje['Subject'] = asunto
-        
+
         # Agregar el cuerpo del mensaje
-        mensaje.attach(MIMEText(cuerpo, 'plain'))
-        
+        body = f"{cuerpo}\n\nAtentamente,\nEquipo {empresa_nombre}"
+        mensaje.attach(MIMEText(body, 'plain'))
+
         # Enviar correo
         with smtplib.SMTP(smtp_server, smtp_port) as servidor:
             servidor.starttls()
             servidor.login(email_sender, email_password)
             servidor.sendmail(email_sender, email_destinatario, mensaje.as_string())
-        
+
         print(f"✅ Notificación enviada exitosamente a {email_destinatario}")
         return True
-    
     except Exception as e:
         print(f"❌ Error al enviar notificación: {str(e)}")
         return False
@@ -185,7 +205,7 @@ class State(rx.State):
     query_solicitud: str = ""
     filter_tipo_solicitud: str = "Todas"
     filter_estado_solicitud: str = "Todas"
-    solicitudes: List[Dict] = []
+    solicitudes: list[dict[str, Any]] = []
     editar_solicitud_id: int = 0
     eliminar_solicitud_id: int = 0
     solicitud_mensaje: str = ""
@@ -210,10 +230,19 @@ class State(rx.State):
     nuevo_estado: str = ""
     respuesta_solicitud: str = ""
     mensaje_actualizar_estado: str = ""
+    respuesta_documento: str = ""
+    respuesta_documento_nombre: str = ""
+    
+    # Campos para asignación de área con mensaje
+    asignar_area_id: int = 0
+    asignar_area_mensaje: str = ""
+    asignar_area_nombre: str = ""
+    asignar_area_seleccionada: str = ""
+    mensaje_asignacion: str = ""
     
     # Campos para consultar estado de solicitud
     consulta_radicado: str = ""
-    solicitud_consultada: Dict = {}
+    solicitud_consultada: dict = {}
     consulta_mensaje: str = ""
     
     @rx.var
@@ -231,6 +260,20 @@ class State(rx.State):
     @rx.var
     def numero_solicitudes_cerradas(self) -> str:
         return str(sum(1 for solicitud in (self.solicitudes or []) if solicitud.get('estado') == 'Cerrada'))
+    
+    @rx.var
+    def estadisticas_por_tipo(self) -> dict[str, int]:
+        counts = {"Petición": 0, "Queja": 0, "Reclamo": 0, "Sugerencia": 0}
+        for solicitud in self.solicitudes or []:
+            tipo = solicitud.get("tipo_solicitud")
+            if tipo in counts:
+                counts[tipo] += 1
+        return counts
+
+    @rx.var
+    def max_registros_tipo(self) -> int:
+        values = list(self.estadisticas_por_tipo.values())
+        return max(values) if values else 1
     
     @rx.var
     def solicitudes_filtradas(self) -> list[dict]:
@@ -257,10 +300,13 @@ class State(rx.State):
     
     def set_filter_tipo_solicitud(self, value: str):
         self.filter_tipo_solicitud = value or "Todas"
-    
+
     def set_filter_estado_solicitud(self, value: str):
         self.filter_estado_solicitud = value or "Todas"
-    
+
+    def buscar_solicitudes(self):
+        self.query_solicitud = (self.query_solicitud or "").strip()
+
     def set_new_password(self, value: str):
         self.new_password = value
     
@@ -366,6 +412,12 @@ class State(rx.State):
     def set_acepta_politica_solicitud(self, checked: bool):
         self.acepta_politica_solicitud = bool(checked)
 
+    def set_acepta_politica_datos(self, checked: bool):
+        self.acepta_politica_datos = bool(checked)
+
+    def set_acepta_notificaciones(self, checked: bool):
+        self.acepta_notificaciones = bool(checked)
+
     def set_documento(self, documento: Any):
         """Actualiza el adjunto cuando el ciudadano selecciona un archivo."""
         if isinstance(documento, dict):
@@ -409,10 +461,34 @@ class State(rx.State):
     def set_respuesta_solicitud(self, val: str):
         self.respuesta_solicitud = val
 
+    def set_respuesta_documento(self, documento: Any):
+        """Actualiza el documento adjunto en la respuesta del funcionario."""
+        if isinstance(documento, dict):
+            name = documento.get("name") or documento.get("filename") or "respuesta_adjunto"
+            self.respuesta_documento_nombre = name
+            self.respuesta_documento = documento
+        elif isinstance(documento, str):
+            self.respuesta_documento_nombre = os.path.basename(documento)
+            self.respuesta_documento = documento
+        else:
+            self.respuesta_documento_nombre = ""
+            self.respuesta_documento = documento
+
+    def set_asignar_area_mensaje(self, val: str):
+        self.asignar_area_mensaje = val
+
+    def set_asignar_area_seleccionada(self, val: str):
+        self.asignar_area_seleccionada = val or ""
+
+    def set_asignar_area_nombre(self, val: str):
+        self.asignar_area_nombre = val or ""
+
     def cerrar_editor_estado(self):
         self.editar_estado_id = 0
         self.nuevo_estado = ""
         self.respuesta_solicitud = ""
+        self.respuesta_documento = ""
+        self.respuesta_documento_nombre = ""
         self.mensaje_actualizar_estado = ""
 
     def set_consulta_radicado(self, val: str):
@@ -431,6 +507,43 @@ class State(rx.State):
             self.mensaje_actualizar_estado = "No puedes cerrar una solicitud sin escribir una respuesta."
             return
         
+        # Guardar documento de respuesta si existe
+        documento_respuesta_guardado = ""
+        if self.respuesta_documento:
+            try:
+                os.makedirs(UPLOAD_DIR, exist_ok=True)
+                # Caso: data URL (base64)
+                if isinstance(self.respuesta_documento, str) and self.respuesta_documento.startswith("data:"):
+                    header, b64 = self.respuesta_documento.split(",", 1)
+                    mime = header.split(";")[0].split(":")[1] if ":" in header else ""
+                    ext = mime.split("/")[-1] if "/" in mime else "bin"
+                    saved_name = f"respuesta_{uuid.uuid4().hex}.{ext}"
+                    path = os.path.join(UPLOAD_DIR, saved_name)
+                    with open(path, "wb") as f:
+                        f.write(base64.b64decode(b64))
+                    documento_respuesta_guardado = path
+                # Caso: objeto con 'content' y 'name'
+                elif isinstance(self.respuesta_documento, dict) and "content" in self.respuesta_documento:
+                    content = self.respuesta_documento.get("content")
+                    name = self.respuesta_documento.get("name", f"respuesta_{uuid.uuid4().hex}")
+                    # Sanitizar nombre de archivo
+                    name = sanitizar_nombre_archivo(name)
+                    if isinstance(content, str) and content.startswith("data:"):
+                        _, b64 = content.split(",", 1)
+                        data = base64.b64decode(b64)
+                    else:
+                        data = base64.b64decode(content)
+                    path = os.path.join(UPLOAD_DIR, name)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    documento_respuesta_guardado = path
+                else:
+                    # Si viene solo el nombre o ruta, lo conservamos tal cual
+                    documento_respuesta_guardado = str(self.respuesta_documento)
+            except Exception as e:
+                print(f"Error guardando documento de respuesta: {e}")
+                # Continuamos sin guardar el documento
+        
         try:
             with rx.session() as session:
                 solicitud_obj = session.get(Solicitud, self.editar_estado_id)
@@ -442,6 +555,11 @@ class State(rx.State):
                 if self.respuesta_solicitud:
                     solicitud_obj.respuesta = self.respuesta_solicitud
                 
+                # Guardar documento de respuesta si existe
+                if documento_respuesta_guardado:
+                    # Si la solicitud no tiene campo para respuesta_documento, lo agregamos como metadato en respuesta
+                    solicitud_obj.respuesta = (solicitud_obj.respuesta or "") + f"\n\n[DOCUMENTO ADJUNTO: {os.path.basename(documento_respuesta_guardado)}]"
+                
                 session.add(solicitud_obj)
                 session.commit()
             
@@ -452,6 +570,8 @@ class State(rx.State):
             self.editar_estado_id = 0
             self.nuevo_estado = ""
             self.respuesta_solicitud = ""
+            self.respuesta_documento = ""
+            self.respuesta_documento_nombre = ""
             self.cargar_solicitudes()
             
             # Enviar notificación por correo al ciudadano
@@ -480,6 +600,12 @@ Detalles de la solicitud:
                     if respuesta_enviada:
                         cuerpo_email += f"Respuesta del funcionario:\n{respuesta_enviada}\n\n"
                     
+                    if documento_respuesta_guardado:
+                        doc_name = os.path.basename(documento_respuesta_guardado)
+                        host_url = os.getenv("APP_URL", "http://localhost:3000").rstrip("/")
+                        doc_url = f"{host_url}/assets/uploads/{doc_name}"
+                        cuerpo_email += f"Documento adjunto: {doc_name}\nDescarga: {doc_url}\n\n"
+                    
                     cuerpo_email += """
 Puedes consultar el estado completo de tu solicitud en nuestro portal web.
 
@@ -502,9 +628,97 @@ Sistema PQRS
         self.editar_estado_id = solicitud_id
         self.nuevo_estado = estado_actual
         self.respuesta_solicitud = ""
+        self.respuesta_documento = ""
+        self.respuesta_documento_nombre = ""
         self.mensaje_actualizar_estado = ""
 
-    def _solicitud_a_dict(self, solicitud: Solicitud) -> Dict[str, Any]:
+    def abrir_asignar_area(self, solicitud_id: int, area_actual: str):
+        """Abre el diálogo para asignar un área a una solicitud con mensaje."""
+        self.asignar_area_id = solicitud_id
+        self.asignar_area_nombre = area_actual
+        self.asignar_area_seleccionada = area_actual or "Atención al Ciudadano"
+        self.asignar_area_mensaje = ""
+        self.mensaje_asignacion = ""
+
+    def cerrar_asignar_area(self):
+        """Cierra el diálogo de asignación de área."""
+        self.asignar_area_id = 0
+        self.asignar_area_nombre = ""
+        self.asignar_area_seleccionada = ""
+        self.asignar_area_mensaje = ""
+        self.mensaje_asignacion = ""
+
+    def asignar_area_con_mensaje(self):
+        """Asigna un área a una solicitud y envía un mensaje al ciudadano."""
+        self.mensaje_asignacion = ""
+        
+        area_a_asignar = self.asignar_area_seleccionada or self.asignar_area_nombre
+        if not self.asignar_area_id or not area_a_asignar:
+            self.mensaje_asignacion = "Selecciona un área válida."
+            return
+        
+        if not self.asignar_area_mensaje:
+            self.mensaje_asignacion = "Escribe un mensaje para el ciudadano."
+            return
+        
+        try:
+            with rx.session() as session:
+                solicitud_obj = session.get(Solicitud, self.asignar_area_id)
+                if not solicitud_obj:
+                    self.mensaje_asignacion = "Solicitud no encontrada."
+                    return
+                
+                solicitud_obj.area_responsable = area_a_asignar
+                session.add(solicitud_obj)
+                session.commit()
+            
+            # Enviar notificación por correo al ciudadano
+            solicitud_info = None
+            for sol in self.solicitudes:
+                if sol['id'] == self.asignar_area_id:
+                    solicitud_info = sol
+                    break
+            
+            if solicitud_info:
+                area_a_asignar = self.asignar_area_seleccionada or self.asignar_area_nombre
+                asunto_email = f"Tu solicitud PQRS ha sido asignada a {area_a_asignar}"
+                cuerpo_email = f"""
+Estimado ciudadano,
+
+Tu solicitud PQRS con número de radicado {solicitud_info['radicado']} ha sido asignada a {area_a_asignar} para su tratamiento.
+
+Detalles de la solicitud:
+- Tipo: {solicitud_info['tipo_solicitud']}
+- Asunto: {solicitud_info['asunto']}
+- Área responsable: {area_a_asignar}
+
+Mensaje del funcionario:
+{self.asignar_area_mensaje}
+
+Puedes consultar el estado completo de tu solicitud en nuestro portal web.
+
+Atentamente,
+Equipo de Atención al Ciudadano
+Sistema PQRS
+"""
+                # Enviar correo al ciudadano
+                enviar_correo_notificacion(solicitud_info['creado_por'], asunto_email, cuerpo_email)
+            
+            self.mensaje_asignacion = f"Área asignada a {area_a_asignar} y mensaje enviado correctamente."
+            self.cargar_solicitudes()
+            self.cerrar_asignar_area()
+        except Exception as e:
+            self.mensaje_asignacion = f"Error asignando área: {e}"
+
+    def _solicitud_a_dict(self, solicitud: Solicitud) -> dict[str, Any]:
+        respuesta_text = solicitud.respuesta or ""
+        respuesta_documento_basename = None
+        if respuesta_text:
+            match = re.search(r"\[DOCUMENTO ADJUNTO:\s*([^\]\|]+)\]", respuesta_text)
+            if match:
+                respuesta_documento_basename = match.group(1).strip()
+                respuesta_text = re.sub(r"\s*\[DOCUMENTO ADJUNTO:[^\]]+\]", "", respuesta_text).strip()
+        documento_basename = solicitud.documento_basename
         return {
             "id": solicitud.id,
             "radicado": solicitud.radicado,
@@ -514,9 +728,12 @@ Sistema PQRS
             "ubicacion": solicitud.ubicacion,
             "area_responsable": solicitud.area_responsable,
             "documento": solicitud.documento,
-            "documento_basename": solicitud.documento_basename,
+            "documento_basename": documento_basename,
+            "documento_href": f"/assets/uploads/{quote(documento_basename)}" if documento_basename else None,
             "estado": solicitud.estado,
-            "respuesta": solicitud.respuesta,
+            "respuesta": respuesta_text,
+            "respuesta_documento_basename": respuesta_documento_basename,
+            "respuesta_documento_href": f"/assets/uploads/{quote(respuesta_documento_basename)}" if respuesta_documento_basename else None,
             "fecha": solicitud.fecha.strftime("%Y-%m-%d %H:%M") if isinstance(solicitud.fecha, datetime) else str(solicitud.fecha),
             "creado_por": solicitud.creado_por,
             "usuario_id": solicitud.usuario_id,
@@ -731,7 +948,7 @@ Sistema PQRS
                     header, b64 = self.documento.split(",", 1)
                     mime = header.split(";")[0].split(":")[1] if ":" in header else ""
                     ext = mime.split("/")[-1] if "/" in mime else "bin"
-                    saved_name = f"adjunto_{uuid.uuid4().hex}.{ext}"
+                    saved_name = f"solicitud_{uuid.uuid4().hex}.{ext}"
                     path = os.path.join(UPLOAD_DIR, saved_name)
                     with open(path, "wb") as f:
                         f.write(base64.b64decode(b64))
@@ -739,7 +956,9 @@ Sistema PQRS
                 # Caso: objeto con 'content' y 'name'
                 elif isinstance(self.documento, dict) and "content" in self.documento:
                     content = self.documento.get("content")
-                    name = self.documento.get("name", f"adjunto_{uuid.uuid4().hex}")
+                    name = self.documento.get("name", f"solicitud_{uuid.uuid4().hex}")
+                    # Sanitizar nombre de archivo
+                    name = sanitizar_nombre_archivo(name)
                     if isinstance(content, str) and content.startswith("data:"):
                         _, b64 = content.split(",", 1)
                         data = base64.b64decode(b64)
@@ -853,74 +1072,289 @@ Sistema PQRS
 
 
     """The app state."""
-
+def label_requerido(texto: str) -> rx.Component:
+    return rx.hstack(
+        rx.text(texto, color=rx.color_mode_cond(light="black", dark="white")),
+        rx.text("*", color="orange.500"),
+        spacing="1",
+        align_items="center",
+    )
 
 def auth_card(title: str, on_submit, show_confirm: bool = False) -> rx.Component:
-    # Definición de colores que cambian según el tema
     text_color = rx.color_mode_cond(light="black", dark="white")
-    input_bg = rx.color_mode_cond(light="white", dark="#2d3748") # gray.700 en modo oscuro
-    input_border = rx.color_mode_cond(light="#cbd5e1", dark="#4a5568") # gray.600 en modo oscuro
+    input_bg = rx.color_mode_cond(light="white", dark="#2d3748")
+    input_border = rx.color_mode_cond(light="#cbd5e1", dark="#4a5568")
     placeholder_color = rx.color_mode_cond(light="#718096", dark="#a0aec0")
 
-    # Estilo base para los inputs
     input_style = {
         "bg": input_bg,
         "border": f"1px solid {input_border}",
         "color": text_color,
-        "_placeholder": {"color": placeholder_color}
+        "_placeholder": {"color": placeholder_color},
     }
 
-    if show_confirm:
-        return rx.card(
-            rx.form(
-                rx.vstack(
-                    rx.heading(title, size="7", color=text_color, margin_bottom="1em"),
-                    rx.grid(
-                        rx.vstack(rx.text([rx.text("Correo electrónico ", color=text_color), rx.text("*", color="orange.500")]), rx.hstack(rx.input(placeholder="Correo electrónico", type="email", value=State.correo, on_change=State.set_correo, border_radius="md", **input_style), rx.cond(State.correo_validado, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text([rx.text("Contraseña ", color=text_color), rx.text("*", color="orange.500")]), rx.hstack(rx.input(placeholder="Contraseña", type="password", value=State.contraseña, on_change=State.set_contraseña, border_radius="md", **input_style), rx.button(rx.cond(State.show_password, rx.icon("eye_off"), rx.icon("eye")), on_click=State.toggle_show_password, variant="ghost", size="2"))),
-                        rx.cond(
-                            State.show_password,
-                            rx.vstack(rx.text([rx.text("Confirmar Contraseña ", color=text_color), rx.text("*", color="orange.500")]), rx.input(placeholder="Confirmar Contraseña", type="password", value=State.confirmar_contraseña, on_change=State.set_confirmar_contraseña, border_radius="md", **input_style)),
-                            rx.text("", display="none")
-                        ),
-                        rx.vstack(rx.text("Tipo de Identificación", font_weight="semibold", color=text_color), rx.select(["Cédula", "Pasaporte", "Tarjeta de Identidad"], placeholder="Selecciona", value=State.tipo_identificacion, on_change=State.set_tipo_identificacion, border_radius="md", **input_style)),
-                        rx.vstack(rx.text([rx.text("Número de Identificación ", color=text_color), rx.text("*", color="orange.500")]), rx.hstack(rx.input(placeholder="Número de Identificación", value=State.numero_identificacion, on_change=State.set_and_validate_numero_identificacion, border_radius="md", **input_style), rx.cond(State.numero_identificacion_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text([rx.text("Nombres ", color=text_color), rx.text("*", color="orange.500")]), rx.hstack(rx.input(placeholder="Nombres", value=State.nombres, on_change=State.set_and_validate_nombres, border_radius="md", **input_style), rx.cond(State.nombres_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text([rx.text("Apellidos ", color=text_color), rx.text("*", color="orange.500")]), rx.hstack(rx.input(placeholder="Apellidos", value=State.apellidos, on_change=State.set_and_validate_apellidos, border_radius="md", **input_style), rx.cond(State.apellidos_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text("Género", color=text_color), rx.select(["Femenino", "Masculino", "Otro", "Prefiero no decirlo"], placeholder="Selecciona", value=State.genero, on_change=State.set_genero, border_radius="md", **input_style)),
-                        rx.vstack(rx.text("Teléfono", color=text_color), rx.hstack(rx.input(placeholder="Teléfono", value=State.telefono, on_change=State.set_and_validate_telefono, border_radius="md", **input_style), rx.cond(State.telefono_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text("Departamento", color=text_color), rx.hstack(rx.input(placeholder="Departamento", value=State.departamento, on_change=State.set_and_validate_departamento, border_radius="md", **input_style), rx.cond(State.departamento_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.vstack(rx.text("Ciudad", color=text_color), rx.hstack(rx.input(placeholder="Ciudad", value=State.ciudad, on_change=State.set_and_validate_ciudad, border_radius="md", **input_style), rx.cond(State.ciudad_valid, rx.image(src="/check-green.svg", height="16px", ml="2"), rx.text("")))),
-                        rx.box(
-                            rx.vstack(
-                                rx.text([rx.text("Dirección ", color=text_color), rx.text("*", color="orange.500")]),
-                                rx.input(placeholder="Dirección", value=State.direccion, on_change=State.set_direccion, border_radius="md", **input_style),
+    confirmar_field = (
+        rx.vstack(
+            label_requerido("Confirmar Contraseña"),
+            rx.input(
+                placeholder="Confirmar Contraseña",
+                type=rx.cond(State.show_password, "text", "password"),
+                value=State.confirmar_contraseña,
+                on_change=State.set_confirmar_contraseña,
+                border_radius="md",
+                **input_style,
+            ),
+        )
+        if show_confirm
+        else rx.box(display="none")
+    )
+
+    return rx.card(
+        rx.form(
+            rx.vstack(
+                rx.heading(title, size="7", color=text_color, margin_bottom="1em"),
+                rx.grid(
+                    rx.vstack(
+                        label_requerido("Correo electrónico"),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Correo electrónico",
+                                type="email",
+                                value=State.correo,
+                                on_change=State.set_correo,
+                                on_blur=State.validar_correo_accion,
+                                border_radius="md",
+                                **input_style,
                             ),
-                            grid_column="1 / -1",
+                            rx.cond(
+                                State.correo_validado,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                            width="100%",
                         ),
-                        template_columns="repeat(3, 1fr)",
-                        gap="4",
                     ),
                     rx.vstack(
-                        rx.checkbox("Acepto recibir notificaciones por correo", is_checked=State.acepta_notificaciones, on_change=State.set_acepta_notificaciones, color=text_color),
-                        rx.checkbox(rx.link("He leído y acepto la Política de Protección de Datos", href="/politica-privacidad", color="blue.500"), is_checked=State.acepta_politica_datos, on_change=State.set_acepta_politica_datos, color=text_color),
-                        spacing="3",
-                        padding_top="4"
+                        label_requerido("Contraseña"),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Contraseña",
+                                type=rx.cond(State.show_password, "text", "password"),
+                                value=State.contraseña,
+                                on_change=State.set_contraseña,
+                                border_radius="md",
+                                width="100%",
+                                **input_style,
+                            ),
+                            rx.button(
+                                rx.cond(State.show_password, rx.icon("eye_off"), rx.icon("eye")),
+                                on_click=State.toggle_show_password,
+                                variant="ghost",
+                                size="2",
+                            ),
+                            width="100%",
+                            spacing="2",
+                        ),
                     ),
-                    rx.text(State.error_de_registro, color="red.500", font_size="sm", font_weight="bold"),
-                    rx.text(State.succes, color="green.500", font_size="sm", font_weight="bold"),
-                    rx.hstack(rx.button(title, type="submit", color_scheme="blue", size="4", width="220px"), rx.link("¿Ya tienes una cuenta? Inicia sesión", href="/login", margin_left="4", color="blue.500"), spacing="4", justify="start"),
-                    spacing="4",
-                    align_items="stretch"
+                    confirmar_field,
+                    rx.vstack(
+                        rx.text("Tipo de Identificación", font_weight="semibold", color=text_color),
+                        rx.select(
+                            ["Cédula", "Pasaporte", "Tarjeta de Identidad"],
+                            placeholder="Selecciona",
+                            value=State.tipo_identificacion,
+                            on_change=State.set_tipo_identificacion,
+                            border_radius="md",
+                            **input_style,
+                        ),
+                    ),
+                    rx.vstack(
+                        label_requerido("Número de Identificación"),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Número de Identificación",
+                                value=State.numero_identificacion,
+                                on_change=State.set_and_validate_numero_identificacion,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.numero_identificacion_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.vstack(
+                        label_requerido("Nombres"),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Nombres",
+                                value=State.nombres,
+                                on_change=State.set_and_validate_nombres,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.nombres_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.vstack(
+                        label_requerido("Apellidos"),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Apellidos",
+                                value=State.apellidos,
+                                on_change=State.set_and_validate_apellidos,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.apellidos_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.vstack(
+                        rx.text("Género", color=text_color),
+                        rx.select(
+                            ["Femenino", "Masculino", "Otro", "Prefiero no decirlo"],
+                            placeholder="Selecciona",
+                            value=State.genero,
+                            on_change=State.set_genero,
+                            border_radius="md",
+                            **input_style,
+                        ),
+                    ),
+                    rx.vstack(
+                        rx.text("Teléfono", color=text_color),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Teléfono",
+                                value=State.telefono,
+                                on_change=State.set_and_validate_telefono,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.telefono_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.vstack(
+                        rx.text("Departamento", color=text_color),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Departamento",
+                                value=State.departamento,
+                                on_change=State.set_and_validate_departamento,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.departamento_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.vstack(
+                        rx.text("Ciudad", color=text_color),
+                        rx.hstack(
+                            rx.input(
+                                placeholder="Ciudad",
+                                value=State.ciudad,
+                                on_change=State.set_and_validate_ciudad,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                            rx.cond(
+                                State.ciudad_valid,
+                                rx.image(src="/check-green.svg", height="16px", ml="2"),
+                                rx.box(),
+                            ),
+                        ),
+                    ),
+                    rx.box(
+                        rx.vstack(
+                            label_requerido("Dirección"),
+                            rx.input(
+                                placeholder="Dirección",
+                                value=State.direccion,
+                                on_change=State.set_direccion,
+                                border_radius="md",
+                                **input_style,
+                            ),
+                        ),
+                        grid_column="1 / -1",
+                    ),
+                    template_columns="repeat(3, 1fr)",
+                    gap="4",
+                    width="100%",
                 ),
-                on_submit=on_submit
+                rx.vstack(
+                    rx.checkbox(
+                        "Acepto recibir notificaciones por correo",
+                        is_checked=State.acepta_notificaciones,
+                        on_change=State.set_acepta_notificaciones,
+                        color=text_color,
+                    ),
+                    rx.checkbox(
+                        rx.link(
+                            "He leído y acepto la Política de Protección de Datos",
+                            href="/politica-privacidad",
+                            color="blue.500",
+                        ),
+                        is_checked=State.acepta_politica_datos,
+                        on_change=State.set_acepta_politica_datos,
+                        color=text_color,
+                    ),
+                    spacing="3",
+                    padding_top="4",
+                    align_items="start",
+                    width="100%",
+                ),
+                rx.cond(
+                    State.error_de_registro != "",
+                    rx.text(State.error_de_registro, color="red.500", font_size="sm", font_weight="bold"),
+                    rx.box(),
+                ),
+                rx.cond(
+                    State.succes != "",
+                    rx.text(State.succes, color="green.500", font_size="sm", font_weight="bold"),
+                    rx.box(),
+                ),
+                rx.hstack(
+                    rx.button(title, type="submit", color_scheme="blue", size="4", width="220px"),
+                    rx.link(
+                        "¿Ya tienes una cuenta? Inicia sesión",
+                        href="/login",
+                        margin_left="4",
+                        color="blue.500",
+                    ),
+                    spacing="4",
+                    justify="start",
+                    width="100%",
+                ),
+                spacing="4",
+                align_items="stretch",
+                width="100%",
             ),
-            p="8",
-            max_width="1100px",
-            box_shadow="2xl",
-            border_radius="2xl",
-            bg=rx.color_mode_cond(light="white", dark="#1a202c"), # Fondo de tarjeta adaptativo
-        )
+            on_submit=on_submit,
+        ),
+        p="8",
+        max_width="1100px",
+        box_shadow="2xl",
+        border_radius="2xl",
+        bg=rx.color_mode_cond(light="white", dark="#1a202c"),
+        width="100%",
+    )
 
 
 def navbar() -> rx.Component:
@@ -931,6 +1365,10 @@ def navbar() -> rx.Component:
                 rx.link("Inicio", href="/", color="white", font_weight="bold", _hover={"opacity": 0.8}),
                 rx.link("Nueva Solicitud", href="/solicitudes", color="white", font_weight="bold", _hover={"opacity": 0.8}),
                 rx.link("Registro de Ciudadano", href="/registro", color="white", font_weight="bold", _hover={"opacity": 0.8}),
+                rx.cond(
+                    State.es_autentica & (State.rol_usuario == "funcionario"),
+                    rx.link("Reportes", href="/reportes", color="white", font_weight="bold", _hover={"opacity": 0.8})
+                ),
                 rx.cond(
                     State.es_autentica & (State.rol_usuario == "funcionario"),
                     rx.link("Registrar Funcionario", href="/registro-funcionario", color="white", font_weight="bold", _hover={"opacity": 0.8}),
@@ -1363,20 +1801,27 @@ def change_password_page() -> rx.Component:
 @rx.page(route="/login", title="Iniciar Sesión")
 def login_page() -> rx.Component:
     return rx.vstack(
-        navbar(),  # Tu barra de navegación superior
-        rx.center(  # Este componente es clave para el centrado total
+        navbar(),
+        rx.center(
             rx.card(
                 rx.vstack(
-                    rx.heading("Iniciar Sesión", size="7", margin_bottom="1em", color=rx.color_mode_cond(light="black", dark="white")),
+                    rx.heading(
+                        "Iniciar Sesión",
+                        size="7",
+                        margin_bottom="1em",
+                        color=rx.color_mode_cond(light="black", dark="white"),
+                    ),
                     rx.input(
-                        placeholder="Correo electrónico", 
+                        placeholder="Correo electrónico",
+                        value=State.correo,
                         on_change=State.set_correo,
                         width="100%",
                     ),
                     rx.hstack(
                         rx.input(
-                            placeholder="Contraseña", 
-                            type_=rx.cond(State.show_password, "text", "password"),
+                            placeholder="Contraseña",
+                            type=rx.cond(State.show_password, "text", "password"),
+                            value=State.contraseña,
                             on_change=State.set_contraseña,
                             width="100%",
                         ),
@@ -1384,39 +1829,43 @@ def login_page() -> rx.Component:
                             rx.cond(State.show_password, rx.icon("eye_off"), rx.icon("eye")),
                             on_click=State.toggle_show_password,
                             variant="ghost",
-                            size="2"
+                            size="2",
                         ),
                         width="100%",
-                        spacing="2"
+                        spacing="2",
                     ),
-                    # Mensaje de éxito/error dinámico
+                    rx.cond(
+                        State.error_de_contraseña != "",
+                        rx.text(State.error_de_contraseña, color="red.500", font_size="0.9em"),
+                        rx.box(),
+                    ),
                     rx.cond(
                         State.succes2 != "",
-                        rx.text(State.succes2, color="green", font_size="0.9em"),
+                        rx.text(State.succes2, color="green.500", font_size="0.9em"),
+                        rx.box(),
                     ),
                     rx.button(
-                        "Entrar", 
-                        on_click=State.login, 
-                        color_scheme="blue", 
+                        "Entrar",
+                        on_click=State.login,
+                        color_scheme="blue",
                         width="100%",
-                        margin_top="1em"
+                        margin_top="1em",
                     ),
                     rx.link(
-                        "¿No tienes cuenta? Regístrate", 
-                        href="/registro", 
+                        "¿No tienes cuenta? Regístrate",
+                        href="/registro",
                         font_size="0.8em",
-                        color="#60a5fa"
+                        color="#60a5fa",
                     ),
                     spacing="4",
                     padding="1.5em",
                 ),
-                width="400px", # Ancho fijo para que se vea como una tarjeta
+                width="400px",
                 box_shadow="lg",
                 border_radius="15px",
             ),
             width="100%",
-            # Calculamos el alto restando la altura aproximada de la navbar
-            min_height="85vh", 
+            min_height="85vh",
         ),
         bg=rx.color_mode_cond(light="#f4f4f5", dark="#0f172a"),
         width="100%",
@@ -1492,7 +1941,7 @@ def dashboard() -> rx.Component:
                                                         rx.text("Documento: ", color=rx.color_mode_cond(light="gray.600", dark="gray.400")),
                                                         rx.link(
                                                             solicitud["documento_basename"],
-                                                            href=f"/assets/uploads/{solicitud['documento_basename']}",
+                                                            href=solicitud.get("documento_href"),
                                                             color="blue.600",
                                                             target="_blank"
                                                         )
@@ -1606,15 +2055,29 @@ def funcionario_dashboard() -> rx.Component:
                     rx.box(
                         rx.vstack(
                             rx.heading("Buscar y Filtrar Solicitudes", size="5", color=rx.color_mode_cond(light="black", dark="white"), margin_bottom="1em"),
-                            rx.input(
-                                placeholder="Buscar por radicado, asunto, descripción o creador...",
-                                value=State.query_solicitud,
-                                on_change=State.set_query_solicitud,
+                            rx.hstack(
+                                rx.icon("search", size=20, color="gray.500"),
+                                rx.input(
+                                    placeholder="Buscar por radicado, asunto, descripción o creador...",
+                                    value=State.query_solicitud,
+                                    on_change=State.set_query_solicitud,
+                                    flex="1",
+                                    min_width="0",
+                                    border="1px solid #cbd5e1",
+                                    padding="12px",
+                                    border_radius="md",
+                                    font_size="16px"
+                                ),
+                                rx.button(
+                                    "Buscar",
+                                    on_click=State.buscar_solicitudes,
+                                    color_scheme="blue",
+                                    size="2",
+                                    min_width="120px"
+                                ),
                                 width="100%",
-                                border="1px solid #cbd5e1",
-                                padding="12px",
-                                border_radius="md",
-                                font_size="16px"
+                                align_items="center",
+                                spacing="2"
                             ),
                             rx.hstack(
                                 rx.vstack(
@@ -1702,7 +2165,7 @@ def funcionario_dashboard() -> rx.Component:
                                                         rx.icon("paperclip", size=16),
                                                         rx.link(
                                                             solicitud["documento_basename"],
-                                                            href=f"/assets/uploads/{solicitud['documento_basename']}",
+                                                            href=solicitud.get("documento_href"),
                                                             color="blue.600",
                                                             font_weight="bold",
                                                             target="_blank"
@@ -1715,8 +2178,15 @@ def funcionario_dashboard() -> rx.Component:
                                                 rx.hstack(
                                                     rx.button(
                                                         "Actualizar Estado",
-                                                        on_click=lambda id=solicitud['id'], estado=solicitud['estado']: State.abrir_editor_estado(id, estado),
+                                                        on_click=lambda _event, id=solicitud['id'], estado=solicitud['estado']: State.abrir_editor_estado(id, estado),
                                                         color_scheme="blue",
+                                                        size="2",
+                                                        variant="outline"
+                                                    ),
+                                                    rx.button(
+                                                        "Asignar Área",
+                                                        on_click=lambda _event, id=solicitud['id'], area=solicitud.get('area_responsable', ''): State.abrir_asignar_area(id, area),
+                                                        color_scheme="green",
                                                         size="2",
                                                         variant="outline"
                                                     ),
@@ -1784,6 +2254,24 @@ def funcionario_dashboard() -> rx.Component:
                                                 ),
                                             )
                                         ),
+                                        rx.vstack(
+                                            rx.text("Documento adjunto (opcional)", font_weight="semibold", color="gray.700"),
+                                            rx.box(
+                                                rx.hstack(
+                                                    rx.image(src="/clip-icon.svg", alt="Adjuntar", height="20px"),
+                                                    rx.text("Arrastra y suelta un archivo o haz clic para explorar", color="gray.600"),
+                                                    rx.spacer(),
+                                                    rx.text(State.respuesta_documento_nombre, font_size="sm", color="gray.500")
+                                                ),
+                                                rx.input(type="file", accept="*/*", on_change=State.set_respuesta_documento, style={"position": "absolute", "inset": "0", "width": "100%", "height": "100%", "opacity": 0, "cursor": "pointer"}),
+                                                position="relative",
+                                                padding="3",
+                                                border="2px dashed #cbd5e1",
+                                                border_radius="8px",
+                                                bg="#f8fafc",
+                                                width="100%",
+                                            )
+                                        ),
                                         rx.button(
                                             "Actualizar Estado",
                                             on_click=State.actualizar_estado_solicitud,
@@ -1812,6 +2300,92 @@ def funcionario_dashboard() -> rx.Component:
                                         align_items="stretch"
                                     ),
                                     on_submit=State.actualizar_estado_solicitud
+                                ),
+                                spacing="4",
+                                align_items="stretch"
+                            ),
+                            p="6",
+                            border="1px solid #e2e8f0",
+                            border_radius="lg",
+                            bg="white",
+                            width="100%",
+                            max_width="600px",
+                            position="fixed",
+                            top="50%",
+                            left="50%",
+                            transform="translate(-50%, -50%)",
+                            z_index="1000",
+                            box_shadow="2xl"
+                        )
+                    ),
+                    rx.cond(
+                        State.asignar_area_id,
+                        rx.box(
+                            rx.vstack(
+                                rx.heading("Asignar área responsable", size="6", color="black"),
+                                rx.form(
+                                    rx.vstack(
+                                        rx.text("Área responsable", font_weight="semibold", color="gray.700"),
+                                        rx.select(
+                                            ["Secretaría", "Contabilidad", "Bienestar", "Tesorería", "Atención al Ciudadano", "Otros"],
+                                            placeholder="Selecciona el área responsable",
+                                            value=State.asignar_area_seleccionada,
+                                            on_change=State.set_asignar_area_seleccionada,
+                                            width="100%",
+                                            bg="#f0f4f8",
+                                            border="1px solid #cbd5e1",
+                                            border_radius="md"
+                                        ),
+                                        rx.cond(
+                                            State.asignar_area_seleccionada == "Otros",
+                                            rx.vstack(
+                                                rx.text("Otra área", font_weight="semibold", color="gray.700"),
+                                                rx.input(
+                                                    placeholder="Escribe el área responsable",
+                                                    value=State.asignar_area_nombre,
+                                                    on_change=State.set_asignar_area_nombre,
+                                                    width="100%",
+                                                    bg="#f0f4f8",
+                                                    border="1px solid #cbd5e1",
+                                                    border_radius="md"
+                                                ),
+                                            )
+                                        ),
+                                        rx.text("Mensaje para el ciudadano", font_weight="semibold", color="gray.700"),
+                                        rx.text_area(
+                                            placeholder="Escribe el mensaje que llegará al ciudadano...",
+                                            value=State.asignar_area_mensaje,
+                                            on_change=State.set_asignar_area_mensaje,
+                                            rows="4"
+                                        ),
+                                        rx.button(
+                                            "Enviar mensaje y asignar",
+                                            on_click=State.asignar_area_con_mensaje,
+                                            color_scheme="green",
+                                            width="100%"
+                                        ),
+                                        rx.button(
+                                            "Cancelar",
+                                            on_click=State.cerrar_asignar_area,
+                                            variant="outline",
+                                            width="100%"
+                                        ),
+                                        rx.cond(
+                                            State.mensaje_asignacion,
+                                            rx.text(
+                                                State.mensaje_asignacion,
+                                                color=rx.cond(
+                                                    State.mensaje_asignacion.contains("correctamente"),
+                                                    "green.500",
+                                                    "red.500"
+                                                ),
+                                                font_weight="semibold"
+                                            )
+                                        ),
+                                        spacing="4",
+                                        align_items="stretch"
+                                    ),
+                                    on_submit=State.asignar_area_con_mensaje
                                 ),
                                 spacing="4",
                                 align_items="stretch"
@@ -1867,19 +2441,19 @@ def solicitudes_page() -> rx.Component:
                             rx.vstack(
                                 # Tipo de solicitud (label + select)
                                 rx.vstack(
-                                    rx.text([rx.text("Tipo de Solicitud ", font_weight="semibold"), rx.text("*", color="orange.500")], align_items="flex-start"),
+                                    label_requerido("Tipo de Solicitud"),
                                     rx.select(["Petición", "Queja", "Reclamo", "Sugerencia"], placeholder="Selecciona el tipo de solicitud", value=State.tipo_solicitud, on_change=State.set_tipo_solicitud, required=True),
                                 ),
 
                                 # Asunto (label + input)
                                 rx.vstack(
-                                    rx.text([rx.text("Asunto ", font_weight="semibold"), rx.text("*", color="orange.500")]),
+                                    label_requerido("Asunto"),
                                     rx.input(placeholder="Asunto", value=State.asunto, on_change=State.set_asunto, required=True, bg="white", border="1px solid #cbd5e1", border_radius="md"),
                                 ),
 
                                 # Descripción detallada (label + textarea + contador)
                                 rx.vstack(
-                                    rx.text([rx.text("Descripción detallada ", font_weight="semibold"), rx.text("*", color="orange.500")]),
+                                    label_requerido("Descripción detallada"),
                                     rx.text_area(placeholder="Escribe aquí los detalles de tu solicitud...", value=State.descripcion, on_change=State.set_descripcion, required=True, rows="4", max_length=1000, style={"resize": "vertical", "minHeight": "120px", "border": "1px solid #cbd5e1", "borderRadius": "8px", "padding": "8px"}, _dark={"bg": "gray.700", "color": "white", "borderColor": "gray.600"}),
                                     rx.hstack(rx.spacer(), rx.text(State.descripcion_len, font_size="sm", color="gray.600"), rx.text(" / 1000 caracteres", font_size="sm", color="gray.600")),
                                 ),
@@ -1890,7 +2464,7 @@ def solicitudes_page() -> rx.Component:
                                 ),
 
                                 rx.vstack(
-                                    rx.text([rx.text("Área Responsable ", font_weight="semibold"), rx.text("*", color="orange.500")]),
+                                    label_requerido("Área Responsable"),
                                     rx.select(
                                         ["Secretaría", "Contabilidad", "Bienestar", "Tesorería", "Atención al Ciudadano", "Otros"],
                                         placeholder="Selecciona el área responsable",
@@ -1906,7 +2480,7 @@ def solicitudes_page() -> rx.Component:
                                 rx.cond(
                                     State.area_responsable == "Otros",
                                     rx.vstack(
-                                        rx.text([rx.text("Otra área", font_weight="semibold"), rx.text("*", color="orange.500")]),
+                                        label_requerido("Otra área"),
                                         rx.input(
                                             placeholder="Escribe el área responsable",
                                             value=State.area_otro,
@@ -1958,21 +2532,25 @@ def solicitudes_page() -> rx.Component:
                                                     rx.text(f"Asunto: {solicitud['asunto']}"),
                                                     rx.text(f"Descripción: {solicitud['descripcion']}"),
                                                     rx.text(f"Creado por: {solicitud.get('creado_por', 'Desconocido')}"),
-                                                    rx.text(
-                                                        "Ubicación: ",
-                                                        rx.cond(
-                                                            solicitud["ubicacion"],
-                                                            solicitud["ubicacion"],
-                                                            "No especificada"
-                                                        )
+                                                    rx.hstack(
+                                                        rx.text("Ubicación: ", font_weight="bold"),
+                                                        rx.text(
+                                                            rx.cond(
+                                                                solicitud["ubicacion"],
+                                                                solicitud["ubicacion"],
+                                                                "No especificada"
+                                                            )
+                                                        ),
                                                     ),
-                                                    rx.text(
-                                                        "Área responsable: ",
-                                                        rx.cond(
-                                                            solicitud["area_responsable"],
-                                                            solicitud["area_responsable"],
-                                                            "No especificada"
-                                                        )
+                                                    rx.hstack(
+                                                        rx.text("Área responsable: ", font_weight="bold"),
+                                                        rx.text(
+                                                            rx.cond(
+                                                                solicitud["area_responsable"],
+                                                                solicitud["area_responsable"],
+                                                                "No especificada"
+                                                            )
+                                                        ),
                                                     ),
                                                     rx.text(f"Estado: {solicitud['estado']}"),
                                                     rx.text(f"Fecha: {solicitud['fecha']}"),
@@ -1982,7 +2560,7 @@ def solicitudes_page() -> rx.Component:
                                                             rx.text("Documento: ", color="gray.600"),
                                                             rx.link(
                                                                 solicitud["documento_basename"],
-                                                                href=f"/assets/uploads/{solicitud['documento_basename']}",
+                                                                href=solicitud.get("documento_href"),
                                                                 color="blue.600",
                                                                 target="_blank"
                                                             )
@@ -2177,9 +2755,26 @@ def consultar_estado_page() -> rx.Component:
                                         rx.text("Documento Adjunto:", font_weight="semibold", color=rx.color_mode_cond(light="black", dark="white")),
                                         rx.link(
                                             State.solicitud_consultada.get("documento_basename", "Ver documento"),
-                                            href=f"/assets/uploads/{State.solicitud_consultada.get('documento_basename', '')}",
+                                            href=State.solicitud_consultada.get("documento_href"),
                                             color="blue.500",
                                             target="_blank"
+                                        ),
+                                        spacing="2"
+                                    )
+                                ),
+                                rx.cond(
+                                    State.solicitud_consultada.get("respuesta_documento_basename"),
+                                    rx.vstack(
+                                        rx.text("Documento adjunto en la respuesta:", font_weight="semibold", color=rx.color_mode_cond(light="black", dark="white")),
+                                        rx.cond(
+                                            State.solicitud_consultada.get("respuesta_documento_href"),
+                                            rx.link(
+                                                State.solicitud_consultada.get("respuesta_documento_basename", "Ver documento"),
+                                                href=State.solicitud_consultada.get("respuesta_documento_href", "#"),
+                                                color="blue.500",
+                                                target="_blank"
+                                            ),
+                                            rx.text("Documento no disponible", color="gray.500")
                                         ),
                                         spacing="2"
                                     )
@@ -2214,6 +2809,111 @@ def consultar_estado_page() -> rx.Component:
     )
 
 
+def reportes_page() -> rx.Component:
+    tipo_counts = State.estadisticas_por_tipo
+    max_count = State.max_registros_tipo or 1
+
+    def grafica_barra(label: str, value: int, color: str):
+        width_pct = int((value / max_count) * 100) if max_count else 0
+        return rx.vstack(
+            rx.text(label, font_weight="semibold", color=rx.color_mode_cond(light="black", dark="white")),
+            rx.hstack(
+                rx.box(
+                    bg=color,
+                    height="18px",
+                    width=f"{width_pct}%",
+                    border_radius="full",
+                    transition="width 0.4s ease"
+                ),
+                rx.text(f"{value}", color="gray.600", font_size="sm", ml="3"),
+                spacing="3",
+                align_items="center"
+            ),
+            spacing="2",
+            width="100%"
+        )
+
+    return rx.container(
+        navbar(),
+        rx.center(
+            rx.card(
+                rx.vstack(
+                    rx.heading("Reportes por tipo y tiempo", size="8", color=rx.color_mode_cond(light="black", dark="white")),
+                    rx.text(
+                        "Visualiza el comportamiento de las solicitudes con indicadores y gráficos claros.",
+                        color=rx.color_mode_cond(light="gray.600", dark="gray.400")
+                    ),
+                    rx.hstack(
+                        rx.box(
+                            rx.heading("Total de Solicitudes", size="5", color="black"),
+                            rx.text(State.numero_solicitudes, font_size="3xl", font_weight="bold", color="blue.600")
+                        ),
+                        rx.box(
+                            rx.heading("Radicadas", size="5", color="black"),
+                            rx.text(State.numero_solicitudes_radicadas, font_size="3xl", font_weight="bold", color="orange.600")
+                        ),
+                        rx.box(
+                            rx.heading("Actualizadas", size="5", color="black"),
+                            rx.text(State.numero_solicitudes_actualizadas, font_size="3xl", font_weight="bold", color="blue.600")
+                        ),
+                        rx.box(
+                            rx.heading("Cerradas", size="5", color="black"),
+                            rx.text(State.numero_solicitudes_cerradas, font_size="3xl", font_weight="bold", color="green.600")
+                        ),
+                        width="100%",
+                        spacing="4",
+                        wrap="wrap"
+                    ),
+                    rx.box(
+                        rx.vstack(
+                            rx.heading("Solicitudes por tipo", size="6", color="black"),
+                            grafica_barra("Petición", tipo_counts.get("Petición", 0), "#2563eb"),
+                            grafica_barra("Queja", tipo_counts.get("Queja", 0), "#f59e0b"),
+                            grafica_barra("Reclamo", tipo_counts.get("Reclamo", 0), "#ef4444"),
+                            grafica_barra("Sugerencia", tipo_counts.get("Sugerencia", 0), "#10b981"),
+                            spacing="4",
+                            width="100%"
+                        ),
+                        p="5",
+                        border="1px solid #e2e8f0",
+                        border_radius="xl",
+                        bg=rx.color_mode_cond(light="#f8fafc", dark="#111827"),
+                        width="100%"
+                    ),
+                    rx.box(
+                        rx.vstack(
+                            rx.heading("Resumen por estado", size="6", color="black"),
+                            grafica_barra("Radicada", int(State.numero_solicitudes_radicadas), "#f59e0b"),
+                            grafica_barra("Actualizada", int(State.numero_solicitudes_actualizadas), "#3b82f6"),
+                            grafica_barra("Cerrada", int(State.numero_solicitudes_cerradas), "#10b981"),
+                            spacing="4",
+                            width="100%"
+                        ),
+                        p="5",
+                        border="1px solid #e2e8f0",
+                        border_radius="xl",
+                        bg=rx.color_mode_cond(light="#f8fafc", dark="#111827"),
+                        width="100%"
+                    ),
+                    rx.text(
+                        "Estas gráficas te permiten comparar rápidamente el volumen de solicitudes por tipo y el estado actual del flujo de atención.",
+                        color=rx.color_mode_cond(light="gray.600", dark="gray.400")
+                    ),
+                    spacing="6",
+                    width="100%"
+                ),
+                max_width="1000px",
+                p="8",
+                box_shadow="2xl",
+                border_radius="2xl",
+                bg=rx.color_mode_cond(light="white", dark="#1a202c")
+            ),
+            min_height="84vh"
+        ),
+        bg=rx.color_mode_cond(light="#f8fafc", dark="#0f172a")
+    )
+
+
 app = rx.App()
 app.add_page(index, route="/", title="Inicio - Sistema PQRS")
 app.add_page(registro_page, route="/registro", title="Registro de Ciudadano")
@@ -2224,3 +2924,12 @@ app.add_page(change_password_page, route="/cambiar-contrasena", title="Cambiar C
 app.add_page(dashboard, route="/dashboard", title="Panel de Ciudadano")
 app.add_page(funcionario_dashboard, route="/dashboard-funcionario", title="Panel de Funcionario")
 app.add_page(consultar_estado_page, route="/consultar-estado", title="Consultar Estado de Solicitud")
+app.add_page(politica_privacidad_page, route="/politica-privacidad", title="Política de Privacidad")
+app.add_page(reportes_page, route="/reportes", title="Reportes PQRS")
+
+if app._api is not None:
+    app._api.mount(
+        "/assets/uploads",
+        StaticFiles(directory=str(UPLOAD_DIR), check_dir=False),
+        name="uploads",
+    )
